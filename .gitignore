@@ -1,0 +1,16 @@
+.DS_Store
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+infra/*.zip
+crash.log
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+pipeline/compiled/
+data/*.csv
+dist/
+build/
