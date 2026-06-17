@@ -1,26 +1,41 @@
-FROM python:3.13-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PORT=8080
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dependencias de serving
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
-# Dependencias de analisis
+# Python deps
 RUN pip install --no-cache-dir \
-    scikit-learn>=1.4.0 \
-    statsmodels>=0.14.0 \
-    seaborn>=0.13.0 \
-    wordcloud>=1.9.0 \
-    nltk>=3.8.0 \
-    google-cloud-storage>=2.18.0
+    fastapi==0.115.0 \
+    uvicorn[standard]==0.32.0 \
+    scikit-learn==1.6.1 \
+    numpy==1.26.4 \
+    scipy==1.14.1 \
+    joblib==1.4.2 \
+    requests==2.32.3 \
+    pydantic==2.9.2 \
+    google-cloud-storage==2.14.0 \
+    google-cloud-secret-manager==2.20.0
 
-COPY src /app/src
-COPY statistical_toolbelt /app/statistical_toolbelt
+# Copy source code
+COPY src/ /app/src/
+
+# Copy model artifacts (for serving mode)
+COPY reports/training/model_final/ /app/model/
+
+# Copy serving entrypoint
+COPY src/serving/train.py /app/entrypoint.py
+
+# Environment
+ENV MODEL_DIR=/app/model
+ENV PORT=8080
+ENV PYTHONPATH=/app
 
 EXPOSE 8080
-CMD ["uvicorn", "src.serving.app:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# Default: serve mode. Override with --mode train for training jobs.
+ENTRYPOINT ["python", "/app/entrypoint.py"]
+CMD ["--mode", "serve"]

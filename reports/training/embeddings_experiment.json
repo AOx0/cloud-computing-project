@@ -1,0 +1,155 @@
+{
+  "hypotheses": {
+    "H19": {
+      "description": "Embeddings contextuales capturan senal que char_wb no captura",
+      "auc_emb_macro": 0.9861,
+      "auc_tfidf_macro": 0.9861,
+      "delta_macro": -0.0,
+      "emb_better_labels": 3,
+      "result": "Parcialmente confirmada",
+      "mechanism": "Embeddings superan TF-IDF en threat (+0.0032), severe_toxic (+0.0021) e identity_hate (+0.0033) donde la senal es semantica. Pierden en obscene (-0.0068) donde la senal es ortografica pura."
+    },
+    "H20": {
+      "description": "TF-IDF + embeddings > cada uno por separado",
+      "auc_combo_macro": 0.9902,
+      "beats_tfidf": true,
+      "beats_emb": true,
+      "combo_best_labels": 6,
+      "result": "Confirmada",
+      "mechanism": "La combinacion supera ambos individuales en 6/6 etiquetas. char_wb captura senal ortografica (obfuscacion), embeddings capturan senal semantica (ironia, amenazas indirectas). Son complementarios."
+    }
+  },
+  "results": {
+    "embeddings_only": {
+      "toxic": {
+        "auc": 0.9781,
+        "f1": 0.7529,
+        "f2": 0.8159,
+        "threshold": 0.2
+      },
+      "severe_toxic": {
+        "auc": 0.9897,
+        "f1": 0.4744,
+        "f2": 0.6178,
+        "threshold": 0.1
+      },
+      "obscene": {
+        "auc": 0.9858,
+        "f1": 0.7418,
+        "f2": 0.8204,
+        "threshold": 0.15
+      },
+      "threat": {
+        "auc": 0.9917,
+        "f1": 0.4022,
+        "f2": 0.5589,
+        "threshold": 0.05
+      },
+      "insult": {
+        "auc": 0.984,
+        "f1": 0.6659,
+        "f2": 0.793,
+        "threshold": 0.1
+      },
+      "identity_hate": {
+        "auc": 0.9874,
+        "f1": 0.5109,
+        "f2": 0.6003,
+        "threshold": 0.15
+      }
+    },
+    "tfidf_only": {
+      "toxic": {
+        "auc": 0.9792,
+        "f1": 0.7517,
+        "f2": 0.828,
+        "threshold": 0.15
+      },
+      "severe_toxic": {
+        "auc": 0.9876,
+        "f1": 0.4496,
+        "f2": 0.6167,
+        "threshold": 0.05
+      },
+      "obscene": {
+        "auc": 0.9926,
+        "f1": 0.7919,
+        "f2": 0.8679,
+        "threshold": 0.1
+      },
+      "threat": {
+        "auc": 0.9885,
+        "f1": 0.4235,
+        "f2": 0.5408,
+        "threshold": 0.05
+      },
+      "insult": {
+        "auc": 0.9848,
+        "f1": 0.7041,
+        "f2": 0.8076,
+        "threshold": 0.1
+      },
+      "identity_hate": {
+        "auc": 0.9841,
+        "f1": 0.4016,
+        "f2": 0.5665,
+        "threshold": 0.05
+      }
+    },
+    "tfidf_plus_emb": {
+      "toxic": {
+        "auc": 0.9847,
+        "f1": 0.7691,
+        "f2": 0.8477,
+        "threshold": 0.15
+      },
+      "severe_toxic": {
+        "auc": 0.9907,
+        "f1": 0.5059,
+        "f2": 0.6398,
+        "threshold": 0.1
+      },
+      "obscene": {
+        "auc": 0.9935,
+        "f1": 0.7846,
+        "f2": 0.87,
+        "threshold": 0.1
+      },
+      "threat": {
+        "auc": 0.9944,
+        "f1": 0.5463,
+        "f2": 0.595,
+        "threshold": 0.15
+      },
+      "insult": {
+        "auc": 0.9877,
+        "f1": 0.7396,
+        "f2": 0.8199,
+        "threshold": 0.15
+      },
+      "identity_hate": {
+        "auc": 0.9905,
+        "f1": 0.487,
+        "f2": 0.6211,
+        "threshold": 0.1
+      }
+    }
+  },
+  "macro_averages": {
+    "embeddings_only": {
+      "auc": 0.9861,
+      "f1": 0.5914,
+      "f2": 0.7011
+    },
+    "tfidf_only": {
+      "auc": 0.9861,
+      "f1": 0.5871,
+      "f2": 0.7046
+    },
+    "tfidf_plus_emb": {
+      "auc": 0.9902,
+      "f1": 0.6387,
+      "f2": 0.7322
+    }
+  }
+}

@@ -452,7 +452,70 @@ El lexico obsceno ("fuck", "gay") aparece entre los top TF-IDF features para obs
 Los umbrales F2-optimos varian por etiqueta: toxic 0.52, obscene 0.70, insult 0.65, identity_hate 0.71, severe_toxic 0.49, threat 0.10. El umbral de 0.10 para *threat* refleja que la clase es tan rara (0.30%) que se necesita un umbral muy bajo para alcanzar recall aceptable (52%). En produccion, el umbral debe ajustarse segun el costo relativo de falsos negativos (comentario amenazante no detectado) vs falsos positivos (moderacion excesiva).
 
 // ============================================================
-// 14. CONCLUSIONES ACTUALIZADAS
+// 14. COMPARACION DE MODELOS CPU-ONLY
+// ============================================================
+= Comparacion de modelos CPU-only
+
+Se compararon seis modelos CPU-only sobre las mismas features (TF-IDF + densos) con el mismo split train/test (80/20, estratificado por any_toxic). Todos los modelos independientes se entrenan por etiqueta con class_weight="balanced". La cadena LightGBM usa el orden jerarquico documentado en el EDA.
+
+== Modelos comparados
+
+#table(
+  columns: (auto, auto, auto, auto),
+  align: left + top,
+  inset: 6pt,
+  [*Modelo*], [*Family*], [*Loss*], [*Tiempo (6 etiquetas)*],
+  [LogisticRegression L1], [Lineal], [Log loss], [75s],
+  [MultinomialNB], [Bayesiano], [Verosimilitud], [less than 1s],
+  [ComplementNB], [Bayesiano], [Verosimilitud complementaria], [less than 1s],
+  [LinearSVC], [Lineal], [Hinge loss], [58s],
+  [SGDClassifier], [Lineal], [Log loss + elasticnet], [3s],
+  [LightGBM Chain], [Boosting], [Binomial deviance], [888s],
+)
+
+== Resultados AUC-ROC
+
+#figure(
+  image("imgs/39_model_auc_heatmap.png", width: 100%),
+  caption: [AUC-ROC por modelo y etiqueta. Rango de color 0.90-1.00.],
+) <auc_heatmap>
+
+#figure(
+  image("imgs/40_model_macro_comparison.png", width: 100%),
+  caption: [Metricas macro: AUC-ROC, F1 y F2 por modelo.],
+) <macro_comp>
+
+LinearSVC alcanza el AUC macro mas alto (0.9724), seguido por LR L1 (0.9705). La cadena LightGBM tiene AUC macro de 0.9470, inferior a todos los modelos lineales excepto SGD. MultinomialNB y ComplementNB son competitivos en AUC (0.96 y 0.96) a pesar de supuestos violados, pero su F1 y F2 son significativamente menores.
+
+== Resultados F1 y F2
+
+En F1 y F2 (que miden rendimiento con umbral de decision), LinearSVC y LR L1 dominan. La cadena LightGBM tiene F1 macro 0.49, inferior al F1 de LinearSVC (0.55). ComplementNB colapsa en F1 (0.12) porque sus predicciones estan mal calibradas y los umbrales F2-optimos no compensan. SGDClassifier falla completamente (AUC 0.61) porque el early stopping detiene el entrenamiento prematuramente con datos desbalanceados.
+
+== Calibracion
+
+LinearSVC con CalibratedClassifierCV (sigmoid) tiene el mejor ECE macro (0.0037). MultinomialNB tiene ECE 0.006. LR L1 tiene el peor ECE (0.10) entre los modelos funcionales. ComplementNB tiene ECE catastrofico (0.46). La calibracion de LinearSVC es notablemente superior porque Platt scaling con CV produce probabilidades bien calibradas, mientras que los arboles de LightGBM y los scores de LR L1 sobre features sparse tienden a sobrecalibrar.
+
+== Evaluacion de hipotesis
+
+*H12 (NB mejor en prevalentes que en raras): REFUTADA.* MultinomialNB tiene AUC relativamente mejor en etiquetas raras (delta -0.008 vs LR) que en prevalentes (delta -0.017). Esto contradice la intuicion de que el supuesto de independencia falla mas donde hay menos datos. La explicacion alternativa es que TF-IDF de n-gramas produce features suficientemente decorrelacionadas para que NB funcione razonablemente, independientemente de la frecuencia de la etiqueta. El supuesto de independencia condicional de NB se aplica a features dado la clase, no a etiquetas entre si.
+
+*H13 (LinearSVC supera LR en F1): CONFIRMADA.* LinearSVC tiene F1 macro 0.5548 vs LR 0.5484 (delta +0.006). La diferencia es pequena pero consistente: LinearSVC supera a LR en 5 de 6 etiquetas en F1. La ventaja viene de hinge loss, que optimiza el margen directamente y produce predicciones mas confiables cerca del umbral. Ademas, LinearSVC con calibracion Platt scaling tiene ECE 10x menor que LR, lo que hace que los umbrales F2-optimos sean mas estables.
+
+*H14 (Chain supera independientes en etiquetas posteriores): REFUTADA.* La cadena tiene AUC 0.9445 en severe_toxic + identity_hate + threat, vs LR con 0.9732 (delta -0.029). Los modelos independientes superan a la cadena en todas las etiquetas posteriores. La razon es que LightGBM con 200-1000 arboles y features sparse de 5000 dimensiones sobreajusta las probabilidades de la cadena, que se convierten en features dominantes pero ruidosas en test. La cadena funciona cuando las predicciones intermedias son calibradas y confiables, pero LightGBM produce probabilidades sobrecalibradas (ECE 0.12 en toxic) que propagan error a las etiquetas posteriores.
+
+#figure(
+  image("imgs/41_model_radar_auc.png", width: 70%),
+  caption: [AUC-ROC por etiqueta y modelo (radar). La ventaja de LinearSVC es consistente en todas las etiquetas.],
+) <radar>
+
+== Implicacion clave: LinearSVC como modelo productivo
+
+LinearSVC con calibracion Platt scaling es el mejor modelo CPU-only para este problema. Tiene el AUC mas alto (0.9724), el F1 mas alto (0.5548), la mejor calibracion (ECE 0.004) y entrena en 58 segundos vs 888 segundos de LightGBM. La combinacion de hinge loss (buen margen) + Platt scaling (buena calibracion) + class_weight balanced (manejo de desbalance) lo hace superior a LR en todos los aspectos que importan para deploy.
+
+La cadena de LightGBM no es el mejor modelo para este problema. Su ventaja teorica (modelar dependencias entre etiquetas) se anula porque las probabilidades intermedias estan mal calibradas y propagan error. Un LinearSVC independiente por etiqueta con predicciones bien calibradas es mas robusto.
+
+// ============================================================
+// 15. CONCLUSIONES ACTUALIZADAS
 // ============================================================
 = Conclusiones
 
@@ -472,7 +535,7 @@ Los umbrales F2-optimos varian por etiqueta: toxic 0.52, obscene 0.70, insult 0.
 
 *Sentimiento y categorias tematicas.* VADER (valencia) y EMPATH (tema) capturan dimensiones parcialmente independientes que mejoran significativamente el baseline. La combinacion texto+VADER+EMPATH alcanza AUC de 0.84 a 0.94, un salto de +0.17 a +0.31 sobre solo texto. VADER sent_neg es el feature individual mas potente para la mayoria de etiquetas, pero EMPATH kill supera a VADER en threat. Los 3,075 comentarios toxicos con sentimiento positivo ilustran la limitacion de los modelos lexicos. La combinacion completa (texto + VADER + EMPATH) sistematicamente supera a cualquier subconjunto, confirmando que las tres dimensiones son complementarias.
 
-*Modelo productivo: Classifier Chain LightGBM.* La cadena de clasificadores con orden toxic → obscene → insult → severe_toxic → identity_hate → threat alcanza AUC-ROC macro de 0.9630 con intervalos de confianza bootstrap al 95% que no incluyen 0.5 en ninguna etiqueta. Las features de la cadena (predicciones de etiquetas anteriores) son las mas importantes para etiquetas posteriores, confirmando que la estructura de dependencia entre etiquetas es la senal dominante para sub-etiquetas. Los umbrales F2-optimos varian de 0.10 (threat) a 0.71 (identity_hate), reflejando el desbalance extremo. LogisticRegression con penalty L1 alcanza AUC marginalmente superiores en 4 de 6 etiquetas, pero las diferencias estan dentro de los IC 95% de LightGBM y LR no modela la estructura de cadena ni ofrece feature importance comparable.
+*Modelo productivo: LinearSVC con calibracion Platt.* La comparacion de seis modelos CPU-only revela que LinearSVC con CalibratedClassifierCV (sigmoid) es el mejor modelo: AUC macro 0.9724, F1 macro 0.5548, ECE macro 0.0037. Supera a LogisticRegression en AUC, F1 y calibracion. Supera a la cadena LightGBM en AUC (0.9724 vs 0.9470) y F1 (0.5548 vs 0.4917) porque las probabilidades intermedias de la cadena propagan error al estar mal calibradas. MultinomialNB es sorprendentemente competitivo en AUC (0.9564) a pesar del supuesto de independencia violado, pero su F1 es inferior. ComplementNB y SGDClassifier no son viables. La arquitectura de deploy usa LinearSVC como modelo principal con calibracion Platt y umbrales F2-optimos por etiqueta.
 
 *Supuestos estadisticos verificados.* Las pruebas de normalidad rechazan la normalidad para todos los features (p < 0.001), lo que justifica el uso de Mann-Whitney U en lugar de t-test. Las correlaciones Pearson entre etiquetas son validas porque las variables son binarias y el tamano de muestra (N = 159,571) garantiza convergencia asintotica. Las pruebas de Chi-cuadrada son validas porque todas las celdas de las tablas de contingencia tienen frecuencias esperadas mayores a 5. El VIF maximo (2.69) indica que no hay multicolinealidad problematica entre etiquetas. Las correlaciones Spearman entre features de VADER y EMPATH son debiles (r < 0.23), confirmando que capturan dimensiones independientes.
 

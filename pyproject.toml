@@ -3,14 +3,20 @@ name = "cloud-computing-project"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "beautifulsoup4>=4.15.0",
     "empath>=0.89",
+    "fastapi>=0.137.1",
+    "gensim>=4.4.0",
     "joblib>=1.5.3",
+    "jupytext>=1.19.3",
     "lightgbm>=4.6.0",
+    "lxml>=6.1.1",
     "nltk>=3.9.4",
     "pandarallel>=1.6.5",
     "pysentimiento>=0.7.3",
     "scikit-learn>=1.9.0",
     "seaborn>=0.13.2",
     "statsmodels>=0.14.6",
+    "uvicorn>=0.49.0",
     "wordcloud>=1.9.6",
 ]
