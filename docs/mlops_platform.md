@@ -19,11 +19,12 @@ Documentacion operativa completa de la plataforma MLOps desplegada en Google Clo
 11. [API endpoints](#11-api-endpoints)
 12. [Cuentas de servicio e IAM](#12-cuentas-de-servicio-e-iam)
 13. [Secret Manager](#13-secret-manager)
-14. [Reentrenamiento automatico](#14-reentrenamiento-automatico)
-15. [Monitoreo](#15-monitoreo)
-16. [Estructura del repositorio](#16-estructura-del-repositorio)
-17. [Modelo final](#17-modelo-final)
-18. [Troubleshooting](#18-troubleshooting)
+14. [Reentrenamiento automatico (implementado)](#14-reentrenamiento-automatico-implementado)
+15. [CI/CD automatico con Cloud Build (implementado)](#15-cicd-automatico-con-cloud-build-implementado)
+16. [Monitoreo](#16-monitoreo)
+17. [Estructura del repositorio](#17-estructura-del-repositorio)
+18. [Modelo final](#18-modelo-final)
+19. [Troubleshooting](#19-troubleshooting)
 
 ---
 
@@ -268,9 +269,9 @@ pipeline/
 *.typ
 ```
 
-### Construir y subir
+### Construir y subir (manual)
 
-Con Cloud Build:
+Con Cloud Build manual:
 
 ```bash
 gcloud builds submit \
@@ -280,6 +281,135 @@ gcloud builds submit \
 Imagen resultante: `us-central1-docker.pkg.dev/mlops-toxic-classifier/mlops-containers/toxic-classifier:latest`
 
 Tamano aprox: ~550 MB (Python 3.11 + sklearn + deps).
+
+### CI/CD automatico con Cloud Build trigger
+
+Cada push a la rama `main` del repo `AOx0/cloud-computing-project` dispara automaticamente un build que construye la imagen, la sube a Artifact Registry y despliega en Cloud Run.
+
+#### Configuracion de la conexion GitHub
+
+Cloud Build usa una conexion GitHub v2 para recibir eventos de push via la GitHub App.
+
+```bash
+# Crear la conexion (requiere autorizacion OAuth en el navegador)
+gcloud builds connections create github github-conn \
+  --project=mlops-toxic-classifier \
+  --region=us-central1
+
+# Despues de autorizar, vincular el repo
+gcloud builds repositories create cloud-computing-project \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --connection=github-conn \
+  --remote-uri="https://github.com/AOx0/cloud-computing-project.git"
+```
+
+La autorizacion OAuth requiere abrir un enlace en el navegador, iniciar sesion con la cuenta de Google vinculada al proyecto y autorizar Cloud Build en GitHub. Despues, instalar la Cloud Build GitHub App en el repo desde https://github.com/settings/installations.
+
+#### Crear el trigger
+
+```bash
+gcloud builds triggers create github \
+  --name="build-on-push" \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --repository="projects/mlops-toxic-classifier/locations/us-central1/connections/github-conn/repositories/cloud-computing-project" \
+  --branch-pattern="^main$" \
+  --build-config="cloudbuild.yaml" \
+  --service-account="projects/mlops-toxic-classifier/serviceAccounts/943214853579-compute@developer.gserviceaccount.com"
+```
+
+#### cloudbuild.yaml
+
+```yaml
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'build',
+        '-t',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA',
+        '-t',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:latest',
+        '.',
+      ]
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'push', '--all-tags',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier',
+      ]
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      [
+        'run', 'deploy', 'toxic-comment-classifier',
+        '--image=us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA',
+        '--region=us-central1',
+        '--platform=managed',
+        '--allow-unauthenticated',
+      ]
+
+options:
+  logging: CLOUD_LOGING_ONLY
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:latest'
+```
+
+La opcion `CLOUD_LOGING_ONLY` es necesaria cuando se usa un service account propio (BYOSA). Sin ella, Cloud Build intenta crear un bucket de logs y falla con error de permisos.
+
+#### Permisos necesarios para CI/CD
+
+```bash
+# Cloud Build SA necesita actuar como compute SA para deploy a Cloud Run
+gcloud iam service-accounts add-iam-policy-binding \
+  943214853579-compute@developer.gserviceaccount.com \
+  --member="serviceAccount:943214853579@cloudbuild.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser" \
+  --project=mlops-toxic-classifier
+
+# Compute SA necesita rol de developer en Cloud Run
+gcloud projects add-iam-policy-binding mlops-toxic-classifier \
+  --member="serviceAccount:943214853579-compute@developer.gserviceaccount.com" \
+  --role="roles/run.developer"
+
+# Cloud Build P4SA necesita acceso a Secret Manager (para la conexion GitHub)
+gcloud projects add-iam-policy-binding mlops-toxic-classifier \
+  --member="serviceAccount:service-943214853579@gcp-sa-cloudbuild.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.admin"
+```
+
+#### Verificar el build
+
+```bash
+# Listar builds recientes
+gcloud builds list --project=mlops-toxic-classifier --limit=5
+
+# Disparar manualmente (para probar sin hacer push)
+gcloud builds triggers run build-on-push \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --branch=main
+
+# Ver revisiones desplegadas en Cloud Run
+gcloud run revisions list \
+  --service=toxic-comment-classifier \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --limit=3
+```
+
+#### Recursos desplegados
+
+| Recurso | Nombre | Detalle |
+|---|---|---|
+| Conexion GitHub | `github-conn` | region us-central1, usuario AOx0 |
+| Repositorio vinculado | `cloud-computing-project` | `AOx0/cloud-computing-project.git` |
+| Trigger | `build-on-push` | branch `^main$`, cloudbuild.yaml |
+| Service account (trigger) | compute SA | BYOSA con CLOUD_LOGING_ONLY |
 
 ---
 
@@ -662,9 +792,10 @@ done
 
 | Cuenta de servicio | Roles |
 |---|---|
-| `mlops-vertex-pipeline@...` | aiplatform.user, storage.objectAdmin, storage.objectCreator, artifactregistry.reader, run.admin, logging.logWriter, secretmanager.secretAccessor |
-| `943214853579-compute@...` | storage.objectAdmin, artifactregistry.writer, logging.logWriter, editor (por defecto) |
-| `943214853579@cloudbuild.gserviceaccount.com` | storage.objectAdmin, artifactregistry.writer |
+| `mlops-vertex-pipeline@...` | aiplatform.user, storage.objectAdmin, storage.objectCreator, artifactregistry.reader, run.admin, logging.logWriter, secretmanager.secretAccessor, run.developer (Cloud Build deploy) |
+| `943214853579-compute@...` | storage.objectAdmin, artifactregistry.writer, logging.logWriter, editor (por defecto), run.developer, iam.serviceAccountUser (Cloud Build impersona) |
+| `943214853579@cloudbuild.gserviceaccount.com` | cloudbuild.builds.builder, storage.objectAdmin, artifactregistry.writer, iam.serviceAccountUser sobre compute SA |
+| `service-943214853579@gcp-sa-cloudbuild.iam...` | secretmanager.admin (para conexion GitHub OAuth) |
 
 ---
 
@@ -692,95 +823,313 @@ api_key = response.payload.data.decode("UTF-8")
 
 ---
 
-## 14. Reentrenamiento automatico
+## 14. Reentrenamiento automatico (implementado)
 
-### Cloud Scheduler + Pub/Sub + Cloud Function
-
-Arquitectura de reentrenamiento periodico:
+El reentrenamiento automatico esta implementado y verificado end-to-end. Cloud Scheduler publica un mensaje cada lunes a las 2 AM (CDMX) en un topico de Pub/Sub. La Cloud Function `trigger-retraining` recibe el evento y lanza un Vertex AI Custom Training Job via el SDK de aiplatform. El job sobreescribe los artefactos en GCS. La siguiente instancia de Cloud Run carga el modelo actualizado.
 
 ```
-Cloud Scheduler (cron semanal)
-    │
-    ▼
-Pub/Sub Topic ("retrain-trigger")
-    │
-    ▼
-Cloud Function ("trigger-retraining")
-    │
-    ▼
-Vertex AI Custom Training Job
+Cloud Scheduler (cron: 0 2 * * 1)
+    |
+    v
+Pub/Sub topic "retrain-trigger"
+    |
+    v
+Cloud Function "trigger-retraining" (gen 2, 512 MiB)
+    |
+    v
+Vertex AI Custom Job (n1-highmem-4, ~13 min)
+    |
+    v
+GCS model/ actualizado (8 archivos, ~30 MB)
+    |
+    v
+Cloud Run carga modelo nuevo en siguiente cold start
 ```
 
-### Configurar Pub/Sub
+### 14.1 Pub/Sub
 
 ```bash
 gcloud pubsub topics create retrain-trigger --project=mlops-toxic-classifier
 ```
 
-### Cloud Function (Python)
+Topico: `projects/mlops-toxic-classifier/topics/retrain-trigger`
 
-```python
-# main.py
-import json
-from google.cloud import aiplatform
+### 14.2 Cloud Function
 
-def trigger_retraining(event, context):
-    project = "mlops-toxic-classifier"
-    region = "us-central1"
-    image = f"{region}-docker.pkg.dev/{project}/mlops-containers/toxic-classifier:latest"
-    sa = f"mlops-vertex-pipeline@{project}.iam.gserviceaccount.com"
+Ubicacion del codigo: `src/cloud_function/main.py`
 
-    aiplatform.init(project=project, location=region)
+La funcion recibe el evento de Pub/Sub, genera un nombre de job con timestamp y lanza un Custom Training Job con `job.submit()` (fire-and-forget, no bloquea hasta completar). Usa el SDK `google-cloud-aiplatform` para crear el job.
 
-    job = aiplatform.CustomJob(
-        display_name="jigsaw-toxic-retraining",
-        worker_pool_specs=[{
-            "machine_spec": {"machine_type": "n1-highmem-4"},
-            "replica_count": 1,
-            "container_spec": {
-                "image_uri": image,
-                "command": ["python", "/app/entrypoint.py"],
-                "args": [
-                    "--mode", "train",
-                    "--project-id", project,
-                    "--gcs-data-uri", f"gs://{project}-ml/train.csv",
-                    "--gcs-output-uri", f"gs://{project}-ml/model",
-                    "--model-dir", "/tmp/model",
-                    "--gcs-embeddings-cache-uri", f"gs://{project}-ml/cache/nomic_embeddings_full.npz",
-                ],
-                "env": [{"name": "SYNTHETIC_API_KEY", "value": "syn_aa37e9b92fa823a7b7a9eab01f24ad06"}],
-            },
-        }],
-        service_account=sa,
-    )
-    job.run(sync=False)
-    print(f"Retraining job submitted: {job.display_name}")
-```
+Parametros del container spec:
+- `--mode train`
+- `--project-id mlops-toxic-classifier`
+- `--gcs-data-uri gs://mlops-toxic-classifier-ml/train.csv`
+- `--gcs-output-uri gs://mlops-toxic-classifier-ml/model`
+- `--gcs-embeddings-cache-uri gs://mlops-toxic-classifier-ml/cache/nomic_embeddings_full.npz`
+- `--synthetic-api-key-secret synthetic-api-key` (el job lee la key desde Secret Manager)
 
-### Desplegar la Cloud Function
+La API key no se pasa como env var. El job la lee desde Secret Manager usando `--project-id` y `--synthetic-api-key-secret`.
+
+#### Desplegar la Cloud Function
 
 ```bash
 gcloud functions deploy trigger-retraining \
-  --runtime python311 \
-  --trigger-topic retrain-trigger \
-  --entry-point trigger_retraining \
-  --project mlops-toxic-classifier
+  --gen2 \
+  --region=us-central1 \
+  --project=mlops-toxic-classifier \
+  --runtime=python312 \
+  --source=src/cloud_function/ \
+  --entry-point=trigger_retraining \
+  --trigger-topic=retrain-trigger \
+  --service-account=mlops-vertex-pipeline@mlops-toxic-classifier.iam.gserviceaccount.com \
+  --timeout=60 \
+  --memory=512Mi \
+  --min-instances=0 \
+  --max-instances=1 \
+  --no-allow-unauthenticated
 ```
 
-### Cloud Scheduler (semanal, lunes 2am)
+Notas sobre la configuracion:
+- **512 MiB** de memoria (256 MiB produce OOM con google-cloud-aiplatform)
+- **timeout 60s** es suficiente porque `job.submit()` solo lanza el job y retorna (no bloquea)
+- **service-account mlops-vertex-pipeline** es la identidad de runtime. Tiene `aiplatform.user`, `storage.objectAdmin`, `secretmanager.secretAccessor`
+- **gen 2** usa Cloud Run como backend, necesita Eventarc habilitado
+
+#### Dependencias
+
+`src/cloud_function/requirements.txt`:
+```
+google-cloud-aiplatform>=1.68.0
+```
+
+### 14.3 Cloud Scheduler
 
 ```bash
-gcloud scheduler jobs create pubsub retrain-weekly \
-  --topic=retrain-trigger \
-  --message-body='{"trigger": "weekly_retrain"}' \
+gcloud scheduler jobs create pubsub retrain-monday-2am \
+  --project=mlops-toxic-classifier \
+  --location=us-central1 \
   --schedule="0 2 * * 1" \
   --time-zone="America/Mexico_City" \
-  --project=mlops-toxic-classifier
+  --topic=retrain-trigger \
+  --message-body='{"trigger": "scheduled", "action": "retrain"}' \
+  --attributes="action=retrain" \
+  --description="Retrain toxic classifier every Monday at 2 AM CDMX"
 ```
+
+Expresion cron `0 2 * * 1`: cada lunes a las 2:00 AM en horario de Ciudad de Mexico.
+
+### 14.4 Permisos necesarios
+
+```bash
+# Habilitar Eventarc (requerido por Cloud Functions gen 2)
+gcloud services enable eventarc.googleapis.com --project=mlops-toxic-classifier
+
+# El SA de Cloud Build P4SA necesita acceso a Secret Manager
+# (para almacenar el token OAuth de la conexion GitHub)
+gcloud projects add-iam-policy-binding mlops-toxic-classifier \
+  --member="serviceAccount:service-943214853579@gcp-sa-cloudbuild.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.admin"
+```
+
+### 14.5 Lanzar reentrenamiento manual
+
+Para lanzar un reentrenamiento fuera del schedule semanal:
+
+```bash
+gcloud pubsub topics publish retrain-trigger \
+  --project=mlops-toxic-classifier \
+  --message='{"action": "retrain"}'
+```
+
+Esto publica un mensaje en el topico, la Cloud Function lo recibe y lanza el Custom Training Job.
+
+### 14.6 Verificar el resultado
+
+```bash
+# Listar Custom Training Jobs recientes
+gcloud ai custom-jobs list \
+  --region=us-central1 \
+  --project=mlops-toxic-classifier \
+  --limit=5 \
+  --sort-by=~create_time
+
+# Verificar artefactos actualizados en GCS
+gsutil ls -l gs://mlops-toxic-classifier-ml/model/
+
+# Verificar que Cloud Run sirve el modelo actualizado
+curl -s https://toxic-comment-classifier-943214853579.us-central1.run.app/health | python3 -m json.tool
+```
+
+### 14.7 Job de ejemplo (verificado)
+
+| Campo | Valor |
+|---|---|
+| Job ID | `2196835210232856576` |
+| Display name | `toxic-classifier-retrain-20260618-014006` |
+| Maquina | `n1-highmem-4` (26 GB RAM) |
+| Duracion | ~13 minutos |
+| Estado | SUCCEEDED |
+| Artefactos | 8 archivos en GCS, timestamps 2026-06-18T01:52:45-46Z |
 
 ---
 
-## 15. Monitoreo
+## 15. CI/CD automatico con Cloud Build (implementado)
+
+El CI/CD esta implementado y verificado end-to-end. Cada push a la rama `main` del fork `AOx0/cloud-computing-project` dispara automaticamente un build que construye la imagen Docker, la sube a Artifact Registry con dos tags (`$COMMIT_SHA` y `latest`) y despliega una nueva revision en Cloud Run.
+
+```
+Push a AOx0/cloud-computing-project (main)
+    |
+    v
+GitHub App webhook -> Cloud Build
+    |
+    v
+cloudbuild.yaml (3 steps):
+  1. docker build  (tags: $COMMIT_SHA, latest)
+  2. docker push --all-tags
+  3. gcloud run deploy (nueva revision)
+    |
+    v
+Cloud Run serving API actualizada (~2 min)
+```
+
+### 15.1 Conexion GitHub v2
+
+Cloud Build usa una conexion GitHub v2 para recibir eventos de push via la GitHub App de Google Cloud Build.
+
+```bash
+# Crear la conexion (requiere autorizacion OAuth en el navegador)
+gcloud builds connections create github github-conn \
+  --project=mlops-toxic-classifier \
+  --region=us-central1
+
+# Despues de autorizar, vincular el repo
+gcloud builds repositories create cloud-computing-project \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --connection=github-conn \
+  --remote-uri="https://github.com/AOx0/cloud-computing-project.git"
+```
+
+La autorizacion OAuth abre un enlace en el navegador. Despues de autorizar con la cuenta de Google, hay que instalar la Cloud Build GitHub App en el repo desde https://github.com/settings/installations. La App se encarga de enviar los webhooks de push a Cloud Build.
+
+### 15.2 Trigger
+
+```bash
+gcloud builds triggers create github \
+  --name="build-on-push" \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --repository="projects/mlops-toxic-classifier/locations/us-central1/connections/github-conn/repositories/cloud-computing-project" \
+  --branch-pattern="^main$" \
+  --build-config="cloudbuild.yaml" \
+  --service-account="projects/mlops-toxic-classifier/serviceAccounts/943214853579-compute@developer.gserviceaccount.com"
+```
+
+### 15.3 cloudbuild.yaml
+
+El archivo define tres pasos secuenciales. Las variables `$PROJECT_ID` y `$COMMIT_SHA` se sustituyen automaticamente por Cloud Build.
+
+```yaml
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'build',
+        '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA',
+        '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:latest',
+        '.',
+      ]
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'push', '--all-tags',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier',
+      ]
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      [
+        'run', 'deploy', 'toxic-comment-classifier',
+        '--image=us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA',
+        '--region=us-central1',
+        '--platform=managed',
+        '--allow-unauthenticated',
+      ]
+
+options:
+  logging: CLOUD_LOGING_ONLY
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:$COMMIT_SHA'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/mlops-containers/toxic-classifier:latest'
+```
+
+La opcion `CLOUD_LOGING_ONLY` es obligatoria cuando se usa un service account propio (BYOSA). Sin ella, Cloud Build intenta crear un bucket de logs y falla con error de permisos.
+
+### 15.4 Permisos necesarios
+
+```bash
+# Cloud Build SA necesita actuar como compute SA para deploy en Cloud Run
+gcloud iam service-accounts add-iam-policy-binding \
+  943214853579-compute@developer.gserviceaccount.com \
+  --member="serviceAccount:943214853579@cloudbuild.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser" \
+  --project=mlops-toxic-classifier
+
+# Compute SA necesita rol de developer en Cloud Run
+gcloud projects add-iam-policy-binding mlops-toxic-classifier \
+  --member="serviceAccount:943214853579-compute@developer.gserviceaccount.com" \
+  --role="roles/run.developer"
+
+# Cloud Build P4SA necesita acceso a Secret Manager
+# (para almacenar el token OAuth de la conexion GitHub)
+gcloud projects add-iam-policy-binding mlops-toxic-classifier \
+  --member="serviceAccount:service-943214853579@gcp-sa-cloudbuild.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.admin"
+```
+
+### 15.5 Disparar manualmente
+
+Para probar el build sin hacer push:
+
+```bash
+gcloud builds triggers run build-on-push \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --branch=main
+```
+
+### 15.6 Verificar
+
+```bash
+# Listar builds recientes
+gcloud builds list --project=mlops-toxic-classifier --limit=5
+
+# Ver revisiones desplegadas
+gcloud run revisions list \
+  --service=toxic-comment-classifier \
+  --project=mlops-toxic-classifier \
+  --region=us-central1 \
+  --limit=3
+
+# Verificar que la API sirve el modelo actualizado
+curl -s https://toxic-comment-classifier-943214853579.us-central1.run.app/health
+```
+
+### 15.7 Recursos desplegados
+
+| Recurso | Nombre | Detalle |
+|---|---|---|
+| Conexion GitHub | `github-conn` | region us-central1, usuario AOx0 |
+| Repositorio vinculado | `cloud-computing-project` | `AOx0/cloud-computing-project.git` |
+| Trigger | `build-on-push` | branch `^main$`, cloudbuild.yaml |
+| Service account | compute SA | BYOSA con CLOUD_LOGING_ONLY |
+| Duracion tipica | ~2 min | build + push + deploy |
+| Builds verificados | `ec5e6a47...` | SUCCESS, disparado por push automatico |
+
+## 16. Monitoreo
 
 ### Alertas recomendadas en Cloud Monitoring
 
@@ -818,12 +1167,13 @@ Para produccion, se recomienda configurar Vertex AI Model Monitoring con:
 
 ---
 
-## 16. Estructura del repositorio
+## 17. Estructura del repositorio
 
 ```
 cloud-computing-project/
   Dockerfile                    # Imagen generica (train + serve)
   .dockerignore
+  cloudbuild.yaml               # CI/CD pipeline: build + push + deploy
   cloudbuild-analysis.yaml      # Cloud Build config para EDA
   docs/
     analysis_report.md          # Reporte completo del analisis
@@ -865,6 +1215,9 @@ cloud-computing-project/
     serving/
       predictor.py              # FastAPI con GCS-first model loading
       train.py                  # Entrypoint dual (train/serve)
+    cloud_function/
+      main.py                   # Cloud Function: lanza retraining job
+      requirements.txt           # google-cloud-aiplatform
     trainer/
       features.py               # FeaturePipeline (TF-IDF + VADER + EMPATH)
       model.py                  # ClassifierChainLGBM
@@ -884,7 +1237,7 @@ cloud-computing-project/
 
 ---
 
-## 17. Modelo final
+## 18. Modelo final
 
 ### Algoritmo
 
@@ -920,7 +1273,7 @@ Los umbrales de decision se optimizaron para el F2-score (beta=2), que prioriza 
 
 ---
 
-## 18. Troubleshooting
+## 19. Troubleshooting
 
 ### OOM en Custom Training Job
 
@@ -980,8 +1333,15 @@ gsutil cp data/nomic_embeddings_full.npz gs://mlops-toxic-classifier-ml/cache/
 # === Artifact Registry ===
 gcloud artifacts repositories create mlops-containers --repository-format=docker --location=us-central1
 
-# === Docker build + push ===
+# === Docker build + push (manual) ===
 gcloud builds submit --tag us-central1-docker.pkg.dev/mlops-toxic-classifier/mlops-containers/toxic-classifier:latest
+
+# === CI/CD automatico ===
+# Push a AOx0/cloud-computing-project (main) dispara build automatico
+# Ver: seccion 15 de este documento
+
+# === Reentrenamiento manual ===
+gcloud pubsub topics publish retrain-trigger --project=mlops-toxic-classifier --message='{"action": "retrain"}'
 
 # === Cloud Run deploy ===
 gcloud run deploy toxic-comment-classifier \

@@ -12,9 +12,22 @@ La misma imagen sirve para ambos modos (`--mode train` y `--mode serve`) via el 
 
 ## Componentes GCP
 
-### Cloud Build
+### Cloud Build + CI/CD automatico
 
-Ejecuta el CI/CD. Construye la imagen Docker y la sube a Artifact Registry. En este proyecto los builds se ejecutaron con `gcloud builds submit --tag ...` directamente, sin usar un archivo `cloudbuild.yaml`.
+Cloud Build ejecuta el CI/CD de forma automatica. Cada push a la rama `main` del fork `AOx0/cloud-computing-project` dispara un build que construye la imagen Docker, la sube a Artifact Registry (con tag `$COMMIT_SHA` y `latest`) y despliega la nueva revision en Cloud Run.
+
+El trigger esta configurado via una conexion GitHub v2 (`github-conn`) que vincula el repo con Cloud Build. El archivo `cloudbuild.yaml` define los tres pasos del pipeline:
+
+1. `docker build` con dos tags (`$COMMIT_SHA` + `latest`)
+2. `docker push --all-tags` a Artifact Registry
+3. `gcloud run deploy` para actualizar el servicio
+
+- **Trigger:** `build-on-push` (v2, region us-central1)
+- **Conexion GitHub:** `github-conn` (usuario autorizado: AOx0)
+- **Repo:** `AOx0/cloud-computing-project`, rama `main`
+- **Build config:** `cloudbuild.yaml` (3 steps, CLOUD_LOGGING_ONLY)
+- **Duracion tipica:** ~2 minutos
+- **Service account:** `943214853579-compute@developer.gserviceaccount.com`
 
 ### Cloud Storage
 
@@ -65,13 +78,18 @@ Almacena la API key de Synthetic (para nomic-embed-text-v1.5). El Custom Trainin
 6. Cloud Run lee los artefactos de GCS al arrancar y carga el modelo en memoria.
 7. Cada request a `/predict` limpia el texto, computa TF-IDF localmente, obtiene embeddings via API, concatena y predice.
 
-## Flujo CI/CD
+## Flujo CI/CD (automatico)
 
-1. Push a GitHub.
-2. Cloud Build construye la imagen Docker.
-3. Cloud Build sube la imagen a Artifact Registry.
-4. Opcionalmente compila y sube el pipeline KFP.
-5. Opcionalmente lanza un Custom Training Job.
+1. Push a `AOx0/cloud-computing-project` (rama `main`).
+2. Cloud Build trigger `build-on-push` detecta el push via GitHub App webhook.
+3. `cloudbuild.yaml` ejecuta 3 pasos:
+   - `docker build` con tags `$COMMIT_SHA` y `latest`
+   - `docker push --all-tags` a Artifact Registry
+   - `gcloud run deploy toxic-comment-classifier` con la imagen `$COMMIT_SHA`
+4. Cloud Run despliega una nueva revision con la imagen actualizada.
+5. La siguiente solicitud a la API usa el codigo nuevo (cold start si escala a cero).
+
+El flujo es completamente automatico. No requiere intervencion manual tras el push.
 
 ## Ciclo de vida MLOps
 
