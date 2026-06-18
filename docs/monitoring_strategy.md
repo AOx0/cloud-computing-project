@@ -1,85 +1,110 @@
-# Monitoring Strategy
+# Estrategia de Monitoreo
 
 ## Data drift
 
-Data drift happens when the production input distribution changes compared with training data. For example, numeric feature ranges, category frequencies, text length, image quality, or missing-value patterns can shift.
+El drift en datos de entrada ocurre cuando la distribucion de los comentarios de produccion difiere de la del dataset de entrenamiento. Para un clasificador de texto, las senales relevantes son:
 
-Use Vertex AI Model Monitoring when the final model schema is known. Configure baseline data from training and compare production requests against that baseline.
+- Longitud media de comentarios (los comentarios de Wikipedia pueden ser distintos a los de redes sociales).
+- Distribucion de TF-IDF features (nuevas formas de ofuscacion, neologismos).
+- Prevalencia de categorias EMPATH (cambio en el tipo de contenido hostil).
+- Distribucion de embeddings (cambio semantico en el vocabulario).
+
+Vertex AI Model Monitoring puede configurarse con baseline del dataset de entrenamiento y comparar contra requests de produccion. Para texto, se recomienda monitorear las estadisticas agregadas (longitud, features mas activos) en vez de comparar feature por feature.
 
 ## Prediction drift
 
-Prediction drift happens when output distributions change. Examples:
+Prediction drift ocurre cuando la distribucion de probabilidades de salida cambia. Ejemplos concretos para este modelo:
 
-- a classifier starts predicting one class too often
-- a regressor shifts toward higher or lower values
-- an NLP model produces unexpected label distributions
+- El modelo predice `toxic` en mas del 20% de los comentarios cuando antes predicia en 10%.
+- La media de `prob(threat)` sube de 0.02 a 0.10 sin cambio aparente en el input.
+- Una etiqueta especifica (e.g. identity_hate) comienza a activarse con frecuencia inusual.
 
-Prediction drift does not always mean the model is wrong, but it is a signal that the environment changed and the model should be reviewed.
+Prediction drift no siempre indica que el modelo esta mal, pero senala que el entorno cambio y el modelo debe revisarse.
 
-## Model degradation
+## Degradacion del modelo
 
-Model degradation happens when real-world performance gets worse over time. It requires ground truth or delayed labels. The architecture should store predictions, labels when available, and evaluation metrics so the team can compare current performance with previous model versions.
+La degradacion requiere etiquetas reales (ground truth) para medirse. En moderacion de contenido, las etiquetas llegan con demora (revision humana). La arquitectura debe almacenar predicciones y, cuando las etiquetas humanas esten disponibles, comparar las metricas actuales contra las del entrenamiento.
 
-## Vertex AI Model Monitoring
+Para este modelo, las metricas a monitorear son:
 
-Use Vertex AI Model Monitoring for:
+| Metrica | Valor baseline (entrenamiento) | Umbral de alerta |
+|---|---|---|
+| AUC macro | 0.9903 | < 0.97 |
+| F1 macro | 0.6388 | < 0.55 |
+| AUC threat | 0.9944 | < 0.98 |
+| AUC identity_hate | 0.9905 | < 0.97 |
 
-- feature skew between training and serving data
-- feature drift over time
-- alerting when drift exceeds thresholds
-- production request sampling
+Estas etiquetas (threat, identity_hate) son las mas vulnerables a degradacion porque su prevalencia es baja (0.3% y 0.88%) y la senal es mas semantica que ortografica.
 
-The exact monitoring config depends on the final model type, input schema, and prediction objective.
+## Alertas en Cloud Monitoring
 
-## Cloud Logging
+| Alerta | Condicion | Severidad |
+|---|---|---|
+| Custom Training Job fallo | Job state = FAILED | Critical |
+| Cloud Run 5xx | Error rate > 1% por 5 min | Warning |
+| Cloud Run latencia | p95 > 2s por 5 min | Warning |
+| API de embeddings fallo | Error rate > 5% en Synthetic API | Warning |
+| Sin trafico | 0 requests en 1 hora | Info |
+| Memoria Cloud Run | Uso > 90% por 5 min | Warning |
 
-Cloud Logging should capture:
+### Configuracion de alertas
 
-- Cloud Build logs
-- Terraform execution logs
-- Cloud Function trigger logs
-- Vertex AI Pipeline job logs
-- component logs
-- endpoint access logs
-- prediction container errors
+```bash
+# Alerta de pipeline failure
+gcloud alpha monitoring policies create \
+  --display-name="Vertex AI Training Failure" \
+  --condition-display-name="Custom Job Failed" \
+  --condition-filter='resource.type="aiplatform_custom_job" AND severity=ERROR' \
+  --project=mlops-toxic-classifier
+```
 
-Logs should include run ids, model display names, dataset ids, metric values, deployment decisions, and endpoint resource names.
+## Logs relevantes
 
-## Cloud Monitoring alerts
+```bash
+# Logs de Cloud Run
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="toxic-comment-classifier"' \
+  --project=mlops-toxic-classifier --limit=50
 
-Recommended alerts:
+# Logs de Custom Training Job
+gcloud logging read \
+  'resource.type="aiplatform_custom_job"' \
+  --project=mlops-toxic-classifier --limit=50
 
-- Vertex AI Pipeline failure
-- Cloud Function execution errors
-- endpoint 5xx errors
-- endpoint latency above SLO
-- endpoint traffic drops unexpectedly
-- model drift threshold exceeded
-- prediction container restart or health check failures
+# Logs de Cloud Build
+gcloud logging read \
+  'resource.type="cloud_build"' \
+  --project=mlops-toxic-classifier --limit=20
+```
 
-The Terraform prototype creates a basic log-based metric and alert for pipeline failures. Production environments should add notification channels and SLO-based policies.
+## Politica de reentrenamiento
 
-## Retraining policy
+El reentrenamiento se puede activar por:
 
-Retraining can be triggered by:
+| Trigger | Configuracion |
+|---|---|
+| Schedule semanal | Cloud Scheduler (lunes 2am, America/Mexico_City) |
+| Drift detectado | Alerta de prediction drift (manual por ahora) |
+| Degradacion | AUC macro < 0.97 en evaluacion con etiquetas humanas |
+| Manual | `gcloud pubsub topics publish retrain-trigger --message='...'` |
 
-- fixed schedule
-- new data availability
-- drift alert
-- metric degradation
-- business event
-- manual approval
+La configuracion actual usa schedule semanal via Cloud Scheduler + Pub/Sub + Cloud Function.
 
-The demo uses weekly retraining through Cloud Scheduler. A production workflow can combine scheduled retraining with event-based retraining.
+## Estrategia de rollback
 
-## Rollback strategy
+Mantener versiones anteriores de artefactos en GCS:
 
-Keep previous model versions in Vertex AI Model Registry. If the new model causes errors, latency issues, drift, or business metric degradation:
+```
+gs://mlops-toxic-classifier-ml/model/              ← version actual (sirve Cloud Run)
+gs://mlops-toxic-classifier-ml/model_archive/v0/   ← version anterior
+gs://mlops-toxic-classifier-ml/model_archive/v1/   ← version anterior
+```
 
-1. reduce traffic to the new deployed model
-2. redeploy or shift traffic to the previous approved model
-3. inspect logs and evaluation artifacts
-4. block future deployment until the root cause is fixed
+Procedimiento de rollback:
 
-For high-risk systems, use canary or shadow deployment before sending all production traffic to the new model.
+1. Copiar version anterior de `model_archive/` a `model/`.
+2. Forzar cold start en Cloud Run (la instancia nueva carga el modelo de GCS).
+3. Inspeccionar logs y metricas para confirmar estabilidad.
+4. Bloquear futuros despliegues hasta identificar la causa raiz.
 
+Para sistemas de alto riesgo, usar despliegue canary o shadow antes de enviar todo el trafico al modelo nuevo.

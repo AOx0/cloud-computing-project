@@ -1,65 +1,96 @@
-# MLOps Workflow
+# Flujo MLOps
 
-## 1. Data ingestion
+## 1. Ingesta de datos
 
-The demo uses a synthetic tabular dataset loaded into BigQuery. In a real project, this step can be replaced with data from transactional systems, data lakes, event streams, image buckets, text corpora, or feature stores.
+El dataset Jigsaw Toxic Comment Classification Challenge (159,571 comentarios de Wikipedia talk pages) se carga a GCS como `train.csv`. No se usa BigQuery ni datos sinteticos. Los datos incluyen 6 etiquetas binarias: toxic, severe_toxic, obscene, threat, insult, identity_hate.
 
-## 2. Data validation
+## 2. Validacion de datos
 
-`validate_data_component` checks basic schema and quality conditions:
+El componente `validate_data` (`pipeline/components/data_validation.py`) verifica:
 
-- table has rows
-- label column exists
-- numeric feature columns exist
-- missing values are reported
+- El CSV tiene filas (count > 0).
+- Las 6 columnas de etiqueta existen.
+- Ningun `comment_text` esta vacio.
+- La prevalencia de cada etiqueta esta dentro del rango esperado (0.3% - 10%).
 
-For production, replace this with business validation rules, statistical checks, schema contracts, or tools such as TensorFlow Data Validation or Great Expectations.
+Para produccion, agregar reglas de negocio (longitud maxima, idioma, contenido prohibido) o herramientas como TensorFlow Data Validation.
 
-## 3. Preprocessing
+## 3. Feature engineering
 
-`preprocess_data_component` fills numeric missing values and creates train/test splits. This can later become image resizing, tokenization, embeddings, feature engineering, windowing, or model-specific transformations.
+Dos representaciones complementarias concatenadas:
 
-## 4. Training
+- **TF-IDF char_wb (2,5):** 194,794 features. Captura la dimension ortografica. `char_wb` respeta los limites de palabra, lo que permite detectar ofuscacion deliberada (`a$$hole`, `f*ck`) sin explosion de vocabulario.
+- **nomic-embed-text-v1.5 (768d):** 768 features densos. Captura la dimension semantica via la Synthetic API con `task_type=classification`. Las amenazas indirectas y el odio encubierto producen embeddings distintos a los de texto innocuo.
 
-`train_model_component` trains a simple sklearn logistic regression model. This is only a placeholder that proves the architecture works.
+Los embeddings se cachean en GCS (`cache/nomic_embeddings_full.npz`, 272 MB) con hash de los IDs para validar integridad. El cache evita ~67 minutos de llamadas API en cada reentrenamiento.
 
-Replace it later with:
+## 4. Entrenamiento
 
-- TensorFlow
-- PyTorch
-- XGBoost
-- computer vision
-- NLP
-- regression
-- classification
-- forecasting
+El Vertex AI Custom Training Job ejecuta `python entrypoint.py --mode train`:
 
-## 5. Evaluation
+1. Descarga `train.csv` de GCS.
+2. Limpia texto (lowercase, URLs, IPs, caracteres especiales).
+3. Computa TF-IDF char_wb sobre el texto limpio.
+4. Descarga embeddings cacheados de GCS (o computa via API y sube cache).
+5. Concatena TF-IDF (sparse) + embeddings (dense) con `scipy.sparse.hstack`.
+6. Para cada etiqueta, entrena LinearSVC (C=0.1, class_weight=balanced) con CalibratedClassifierCV (sigmoid, cv=3).
+7. Sube los 7 joblib + metadata.json a GCS.
 
-`evaluate_model_component` calculates a generic metric and returns a boolean deployment decision.
+Tipo de maquina: `n1-highmem-4` (26 GB RAM). `n1-standard-4` (15 GB) produce OOM.
 
-Current example:
+## 5. Evaluacion
 
-```text
-deploy_decision = metric_value >= deploy_threshold
-```
+El componente `evaluate_model` (`pipeline/components/evaluate.py`) calcula:
 
-For a real business problem, the threshold must reflect business risk. A fraud model, a medical model, a recommendation model, and a churn model should not use the same acceptance rule.
+- AUC-ROC por etiqueta.
+- AUC macro (promedio simple).
+- Decision de despliegue: `auc_macro >= deploy_threshold` (default 0.95).
 
-## 6. Conditional deployment
+Si la metrica no pasa, el pipeline guarda el reporte y se detiene antes del despliegue.
 
-If the metric passes, Google Cloud Pipeline Components upload the model to Vertex AI Model Registry and deploy it to Vertex AI Endpoint. If the metric fails, the pipeline saves the evaluation report and stops before deployment.
+## 6. Despliegue condicional
+
+Si la metrica pasa, los artefactos ya estan en GCS. Cloud Run los carga al arrancar. No se usa Vertex AI Model Registry ni Vertex AI Endpoints porque el modelo es pequeno (30 MB) y predice en milisegundos. Cloud Run escala a cero y es mas economico para trafico intermitente.
 
 ## 7. Serving
 
-The serving image is a FastAPI container that follows Vertex AI custom prediction container conventions:
+Cloud Run ejecuta `python entrypoint.py --mode serve`. La app FastAPI (`src/serving/predictor.py`):
 
-- `/health`
-- `/predict`
+1. Al arrancar, descarga los artefactos del modelo desde GCS si no existen localmente.
+2. Carga TF-IDF + 6 LinearSVC calibrados en memoria.
+3. Cada request a `/predict` limpia el texto, computa TF-IDF localmente, obtiene embeddings via Synthetic API, concatena y predice.
+4. Retorna probabilidades por etiqueta y etiquetas binarias aplicando umbrales F2-optimal.
 
-The current implementation loads `model.joblib`. A real model can replace the predictor class and keep the same deployment architecture.
+Endpoints:
 
-## 8. Retraining
+| Ruta | Metodo | Descripcion |
+|---|---|---|
+| `/health` | GET | Estado del modelo |
+| `/predict` | POST | Prediccion de toxicidad |
+| `/model_info` | GET | Metadatos del modelo |
 
-Cloud Scheduler publishes a weekly Pub/Sub event. Cloud Function receives the event and submits a Vertex AI Pipeline job. The Pub/Sub message can override runtime parameters such as dataset, threshold, metric, image, or endpoint.
+## 8. Reentrenamiento
 
+Cloud Scheduler publica un mensaje semanal en Pub/Sub. La Cloud Function `trigger-retraining` recibe el evento y lanza un Vertex AI Custom Training Job con los parametros configurados (datos, cache de embeddings, URI de salida). El job sobreescribe los artefactos en GCS. La siguiente instancia de Cloud Run carga el modelo actualizado.
+
+Disparo manual:
+
+```bash
+gcloud pubsub topics publish retrain-trigger \
+  --message='{"reason":"manual-retraining"}'
+```
+
+## 9. Rollback
+
+Los artefactos previos pueden archivarse en GCS con versiones (`model/v1/`, `model/v2/`). Para revertir, copiar la version anterior a `model/` y reiniciar Cloud Run (forzar cold start).
+
+```bash
+# Archivar modelo actual
+gsutil -m cp gs://mlops-toxic-classifier-ml/model/* gs://mlops-toxic-classifier-ml/model_archive/v1/
+
+# Restaurar version anterior
+gsutil -m cp gs://mlops-toxic-classifier-ml/model_archive/v0/* gs://mlops-toxic-classifier-ml/model/
+
+# Forzar cold start en Cloud Run
+gcloud run services update toxic-comment-classifier --region=us-central1 --no-traffic
+```

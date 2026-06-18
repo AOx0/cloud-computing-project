@@ -1,105 +1,140 @@
-# Architecture
+# Arquitectura
 
-## Mermaid diagram
+## Diagrama
 
-```mermaid
-flowchart LR
-    GH["GitHub Repository"] --> CB["Cloud Build CI/CD"]
-    CB --> TF["Terraform IaC"]
-    CB --> IMG["Build Docker Image"]
-    IMG --> AR["Artifact Registry"]
-    CB --> COMPILE["Compile KFP Pipeline"]
-    COMPILE --> GCS_TEMPLATE["GCS Pipeline Template"]
-
-    TF --> APIs["Enabled GCP APIs"]
-    TF --> IAM["Service Accounts and IAM"]
-    TF --> GCS["Cloud Storage Artifacts"]
-    TF --> BQ["BigQuery Dataset"]
-    TF --> TOPIC["Pub/Sub Topic"]
-    TF --> SCHED["Cloud Scheduler"]
-    TF --> CF["Cloud Function"]
-    TF --> ENDPOINT["Vertex AI Endpoint"]
-    TF --> LOGS["Cloud Logging and Monitoring"]
-
-    SCHED --> TOPIC
-    TOPIC --> CF
-    CF --> PIPE["Vertex AI Pipelines"]
-
-    BQ --> V1["Data Validation"]
-    V1 --> V2["Preprocessing"]
-    V2 --> V3["Train Placeholder Model"]
-    V3 --> V4["Evaluate Metrics"]
-    V4 --> GATE{"Metric >= threshold?"}
-    GATE -- "No" --> REPORT["Save Report and Stop"]
-    GATE -- "Yes" --> REG["Vertex AI Model Registry"]
-    REG --> ENDPOINT
-
-    PIPE --> V1
-    PIPE --> GCS
-    ENDPOINT --> MONITOR["Vertex AI Model Monitoring"]
-    MONITOR --> LOGS
+```
+                     ┌──────────────────────────────────────────────┐
+                     │            GitHub Repository                 │
+                     └──────────────────────┬─────────────────────┘
+                                            │ push
+                                            ▼
+                     ┌──────────────────────────────────────────────┐
+                     │            Cloud Build (CI/CD)                │
+                     │                                              │
+                     │  1. Build imagen Docker                      │
+                     │  2. Push a Artifact Registry                  │
+                     │  3. Compile pipeline KFP (opcional)          │
+                     └──────────────────────┬─────────────────────┘
+                                            │
+               ┌────────────────────────────┼────────────────────────────┐
+               │                            │                            │
+               ▼                            ▼                            ▼
+    ┌──────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
+    │ Artifact Registry │     │   Vertex AI Custom    │     │     Cloud Run       │
+    │                  │     │   Training Job        │     │   (Serving API)     │
+    │ toxic-classifier │     │                      │     │                     │
+    │ :latest          │     │  python entrypoint.py│     │  python entrypoint.py│
+    │                  │     │  --mode train        │     │  --mode serve       │
+    └────────┬─────────┘     └──────────┬───────────┘     └──────────┬──────────┘
+             │                          │                             │
+             │  misma imagen            │ escribe                     │ lee
+             │                          ▼                             ▼
+             │            ┌──────────────────────────────────────────────────┐
+             │            │          Cloud Storage (GCS)                     │
+             │            │    gs://mlops-toxic-classifier-ml/               │
+             │            │                                                 │
+             │            │  train.csv          datos de entrenamiento     │
+             │            │  model/             artefactos del modelo       │
+             │            │  cache/             embeddings cacheados (npz)  │
+             │            │  pipeline_templates/ pipeline KFP compilado     │
+             │            │  pipeline_root/     artefactos de ejecucion     │
+             │            └──────────────────────────────────────────────────┘
+             │                          ▲                             │
+             │                          │ trigger                     │
+             │            ┌────────────┴───────────┐                 │
+             │            │  Cloud Scheduler        │                 │
+             │            │  (cron semanal)         │                 │
+             │            └────────────┬───────────┘                 │
+             │                         │ Pub/Sub                      │
+             │                         ▼                              │
+             │            ┌───────────────────────┐                  │
+             │            │  Cloud Function        │                  │
+             │            │  trigger-retraining    │──────────────────┘
+             │            │  lanza Custom Job      │
+             │            └───────────────────────┘     modelo actualizado
+             │                                          via cold start
+             ▼
+    ┌──────────────────┐
+    │ Secret Manager   │
+    │ synthetic-api-key│
+    └──────────────────┘
 ```
 
-## GCP services
+## Principio de diseno: GCS como contrato
 
-Cloud Build runs the CI/CD workflow. It validates Terraform, optionally applies infrastructure, builds the serving image, pushes it to Artifact Registry, compiles the Vertex AI Pipeline, uploads the template to Cloud Storage, and can optionally submit a pipeline run.
+La imagen Docker es generica. No contiene el modelo ni los datos. Esto desacopla entrenamiento de serving:
 
-Terraform creates the reusable platform: service accounts, IAM bindings, Cloud Storage, BigQuery, Artifact Registry, Pub/Sub, Cloud Scheduler, Cloud Function, Vertex AI Endpoint, and basic monitoring resources.
+- El **Custom Training Job** lee datos de GCS, entrena el modelo y escribe artefactos a GCS.
+- **Cloud Run** descarga los artefactos de GCS al arrancar (cold start) y los carga en memoria.
+- Cuando el pipeline reentrena, los artefactos en GCS se actualizan. La siguiente instancia de Cloud Run carga el modelo nuevo.
 
-Cloud Storage stores the pipeline root, component artifacts, compiled pipeline template, model artifacts, validation reports, and evaluation reports.
+La misma imagen sirve para ambos modos (`--mode train` y `--mode serve`) via el entrypoint `src/serving/train.py`.
 
-BigQuery stores the example synthetic training table and can later store production datasets, feature views, monitoring exports, and model metrics.
+## Servicios GCP
 
-Artifact Registry stores Docker images for training and serving. The current image serves the sklearn placeholder model, but the same repository can host TensorFlow, PyTorch, XGBoost, CV, NLP, or custom prediction containers.
+### Cloud Build
 
-Vertex AI Pipelines orchestrates the ML workflow with Kubeflow Pipelines and Google Cloud Pipeline Components.
+Ejecuta el CI/CD. Construye la imagen Docker y la sube a Artifact Registry. Opcionalmente compila el pipeline KFP y lo sube a GCS.
 
-Vertex AI Model Registry stores approved model versions. The demo uploads a model only when the configured metric passes the threshold.
+### Cloud Storage
 
-Vertex AI Endpoint serves the approved model. Terraform creates the endpoint once, and the pipeline deploys new approved model versions to it.
+Almacena todos los artefactos que no pertenecen al codigo fuente:
 
-Cloud Scheduler, Pub/Sub, and Cloud Function automate periodic retraining. Scheduler publishes a message, Pub/Sub delivers it, and the function launches a Vertex AI Pipeline job.
+| Ruta | Contenido |
+|---|---|
+| `train.csv` | Dataset de entrenamiento (159,571 filas, 65 MB) |
+| `model/*.joblib` | 6 LinearSVC calibrados + TF-IDF vectorizador |
+| `model/metadata.json` | Umbrales F2-optimal, metricas, configuracion |
+| `cache/nomic_embeddings_full.npz` | Embeddings cacheados (272 MB) para evitar recomputar |
+| `pipeline_templates/mlops_pipeline.json` | Pipeline KFP compilado |
 
-Cloud Logging and Cloud Monitoring centralize operational logs and alerts. Vertex AI Model Monitoring should be configured for production drift and skew monitoring after a model and serving schema are known.
+### Artifact Registry
 
-## Data flow
+Almacena la imagen Docker `toxic-classifier:latest`. La imagen contiene Python 3.11, scikit-learn, FastAPI y el codigo fuente. No contiene el modelo.
 
-1. Synthetic data is generated locally and loaded to BigQuery.
-2. The pipeline reads the source table from BigQuery.
-3. Data validation checks row count, expected label column, numeric features, and missing values.
-4. Preprocessing creates train/test artifacts in Cloud Storage.
-5. Training creates a placeholder sklearn model artifact.
-6. Evaluation calculates a generic metric such as accuracy or roc_auc.
-7. If the metric is below threshold, the pipeline stops before deployment and saves the report.
-8. If the metric passes, the model is uploaded to Vertex AI Model Registry.
-9. The model is deployed to the Terraform-created Vertex AI Endpoint.
-10. Logs, reports, artifacts, and endpoint activity become monitoring inputs.
+### Vertex AI Custom Training Job
 
-## CI/CD flow
+Ejecuta el entrenamiento en una VM efimera. Lee datos y embeddings de GCS, entrena 6 LinearSVC calibrados, sube artefactos a GCS. Tipo de maquina: `n1-highmem-4` (26 GB RAM, requerido porque el TF-IDF con 194k features + embeddings para 159k filas supera 15 GB en fit).
 
-1. Code is pushed to GitHub.
-2. Cloud Build validates Terraform.
-3. Cloud Build optionally applies Terraform.
-4. Cloud Build builds and pushes the serving container.
-5. Cloud Build compiles the KFP pipeline template.
-6. Cloud Build uploads the template to Cloud Storage.
-7. Cloud Build optionally runs the pipeline.
+### Cloud Run
 
-## MLOps lifecycle
+Sirve la API de prediccion. Lee el modelo de GCS al arrancar. Expone `/health`, `/predict`, `/model_info`. Escala a cero cuando no hay trafico. Cada prediccion computa TF-IDF localmente y llama la Synthetic API para embeddings.
 
-The architecture supports the complete lifecycle:
+### Cloud Scheduler + Pub/Sub + Cloud Function
 
-- Data ingestion
-- Data validation
-- Preprocessing
-- Training
-- Evaluation
-- Conditional deployment
-- Model registry
-- Endpoint deployment
-- Monitoring
-- Retraining
-- Rollback
+Automatiza el reentrenamiento periodico. Cloud Scheduler publica un mensaje en Pub/Sub, la Cloud Function recibe el evento y lanza un Vertex AI Custom Training Job con los parametros configurados.
 
-The model-specific parts are intentionally isolated in component files so that the platform remains useful before the final ML use case is chosen.
+### Secret Manager
 
+Almacena la API key de Synthetic (para nomic-embed-text-v1.5). El Custom Training Job puede leer la key desde Secret Manager si no se pasa como env var.
+
+## Flujo de datos
+
+1. El dataset (`train.csv`) se carga a GCS manualmente.
+2. El Custom Training Job lee el dataset y el cache de embeddings desde GCS.
+3. Si no hay cache de embeddings, computa via Synthetic API y sube el cache a GCS.
+4. Entrena 6 LinearSVC + CalibratedClassifierCV sobre TF-IDF + embeddings.
+5. Sube los artefactos (joblib + metadata.json) a GCS.
+6. Cloud Run lee los artefactos de GCS al arrancar y carga el modelo en memoria.
+7. Cada request a `/predict` limpia el texto, computa TF-IDF localmente, obtiene embeddings via API, concatena y predice.
+
+## Flujo CI/CD
+
+1. Push a GitHub.
+2. Cloud Build construye la imagen Docker.
+3. Cloud Build sube la imagen a Artifact Registry.
+4. Opcionalmente compila y sube el pipeline KFP.
+5. Opcionalmente lanza un Custom Training Job.
+
+## Ciclo de vida MLOps
+
+- **Ingesta de datos:** carga manual a GCS.
+- **Validacion de datos:** componente KFP que verifica filas, etiquetas, textos no vacios, balance.
+- **Feature engineering:** TF-IDF char_wb (2,5) + nomic-embed-text-v1.5 (768d).
+- **Entrenamiento:** Vertex AI Custom Training Job.
+- **Evaluacion:** AUC por etiqueta, AUC macro, gate de despliegue (>= 0.95).
+- **Despliegue condicional:** si la metrica pasa, el modelo se despliega. Si no, se guarda el reporte y se detiene.
+- **Serving:** Cloud Run con GCS-first model loading.
+- **Monitoreo:** Cloud Logging, Cloud Monitoring, drift detection.
+- **Reentrenamiento:** Cloud Scheduler semanal via Pub/Sub + Cloud Function.
+- **Rollback:** versiones anteriores en GCS, desplegar revision anterior en Cloud Run.

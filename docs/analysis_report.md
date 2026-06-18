@@ -315,20 +315,19 @@ Tres pruebas complementarias con correccion Bonferroni (alpha = 0.0083 por etiqu
 
 | Componente | Recurso | Estado |
 |---|---|---|
-| Proyecto | mlops-toxic-comments (288509175890) | Activo |
-| Billing | 012F44-E86707-0459F2 | Vinculado |
-| GCS | gs://mlops-toxic-comments-ml/ | Creado, datos subidos |
-| Artifact Registry | us-central1-docker.pkg.dev/.../mlops-containers/ | Creado |
-| Vertex AI | API habilitada | Pendiente pipeline real |
-| Cloud Build | cloudbuild-analysis.yaml | Pendiente actualizar |
-| Cloud Run | API habilitada | Pendiente serving real |
+| Proyecto | mlops-toxic-classifier (943214853579) | Activo |
+| Billing | 017496-4917BA-727421 | Vinculado |
+| GCS | gs://mlops-toxic-classifier-ml/ | Creado, datos + modelo + cache subidos |
+| Artifact Registry | us-central1-docker.pkg.dev/.../mlops-containers/toxic-classifier | Imagen subida |
+| Vertex AI | Custom Training Job ejecutado exitosamente | SUCCEEDED |
+| Cloud Build | cloudbuild-analysis.yaml | Funcional |
+| Cloud Run | toxic-comment-classifier (us-central1) | Desplegado y verificando |
+| Secret Manager | synthetic-api-key | Creado |
+| Service Account | mlops-vertex-pipeline@...iam.gserviceaccount.com | 7 roles asignados |
 
-**Brechas para deploy:**
+**Arquitectura desacoplada:** La imagen Docker es generica (no contiene el modelo). El Custom Training Job escribe artefactos a GCS. Cloud Run los lee al arrancar. Misma imagen para `--mode train` y `--mode serve`. Los embeddings se cachean en GCS para evitar ~67 min de llamadas API en reentrenamientos subsecuentes.
 
-1. **Serving predictor:** usa SklearnPredictor que carga un solo joblib. Necesita reescribirse para cargar LinearSVC + CalibratedClassifierCV + TF-IDF char_wb, aceptar texto crudo y retornar probabilidades por etiqueta.
-2. **Dockerfile:** no incluye scikit-learn con LinearSVC ni el feature pipeline.
-3. **KFP components:** usan placeholder LR. Necesitan reescribirse para LinearSVC real.
-4. **Modelo en GCS:** no subido. Directorio `reports/training/model/` debe subirse a `gs://mlops-toxic-comments-ml/model/`.
+Documentacion operativa completa en `docs/mlops_platform.md`.
 
 ---
 
@@ -361,7 +360,7 @@ Tres pruebas complementarias con correccion Bonferroni (alpha = 0.0083 por etiqu
 |---|---|---|
 | `data/sentiment_scores.csv` | 3.5 MB | VADER scores para 159k comentarios |
 | `data/empath_scores.parquet` | 9.7 MB | EMPATH scores para 159k comentarios |
-| `data/empath_scores.csv` | 152 MB | EMPATH scores (original, usar parquet) |
+| `data/nomic_embeddings_full.npz` | 272 MB | Embeddings nomic-embed cacheados (tambien en GCS) |
 
 ### Reportes
 
@@ -370,23 +369,23 @@ Tres pruebas complementarias con correccion Bonferroni (alpha = 0.0083 por etiqu
 | `reports/eda/main.typ` | Reporte Typst completo (15 secciones) |
 | `reports/eda/main.pdf` | PDF compilado (3.4 MB) |
 | `reports/eda/imgs/` | 54 figuras PNG (01-44) |
-| `reports/training/model/` | Modelo LightGBM Chain entrenado + feature pipeline |
-| `reports/training/model_svc/` | **Modelo productivo final** (LinearSVC + char_wb, 7 joblib, ~27 MB) |
+| `reports/training/model_final/` | Modelo productivo final (LinearSVC + char_wb + embeddings, 7 joblib, ~30 MB) |
 | `reports/training/metrics.json` | Metricas del modelo productivo |
 | `reports/training/model_comparison.json` | Comparacion 6 modelos CPU-only |
 | `reports/training/nb_variants.json` | Variantes NB |
 | `reports/training/charwb_ridge.json` | char_wb + Ridge |
 | `reports/training/validacion_estadistica.json` | Resultados de validacion rigurosa |
+| `reports/training/embeddings_experiment.json` | Experimento TF-IDF vs embeddings |
 
 ### GCP
 
 | Archivo | Descripcion |
 |---|---|
 | `cloudbuild-analysis.yaml` | Cloud Build para analisis estadistico |
-| `cloudbuild.yaml` | Cloud Build principal (Terraform + pipeline + serving) |
-| `Dockerfile` | Imagen Docker para serving |
-| `infra/` | Terraform IaC |
+| `Dockerfile` | Imagen Docker generica (train + serve) |
 | `pipeline/` | Vertex AI Pipeline components (KFP) |
+| `src/serving/predictor.py` | FastAPI con GCS-first model loading |
+| `src/serving/train.py` | Entrypoint dual (train/serve) + embeddings cache |
 
 ---
 
@@ -402,7 +401,7 @@ Tres pruebas complementarias con correccion Bonferroni (alpha = 0.0083 por etiqu
 
 ## 14. Proximos pasos
 
-1. **Deploy:** Reescribir serving predictor, subir modelo LinearSVC+char_wb a GCS, construir Docker, deploy en Cloud Run.
-2. **Vertex AI Pipeline:** Reescribir componentes KFP para entrenamiento real (LinearSVC + char_wb).
-3. **DistilBERT embeddings:** Si se dispone de GPU, extraer embeddings congelados como features adicionales a LinearSVC. Hipotesis: la senal semantica contextual complementa la senal lexica de char_wb.
-4. **Calibracion de umbrales por costo:** Definir funcion de costo asimetrico por etiqueta segun el contexto de moderacion, reemplazando el F2-optimo generico.
+1. **DistilBERT embeddings:** Si se dispone de GPU, extraer embeddings congelados como features adicionales a LinearSVC. Hipotesis: la senal semantica contextual complementa la senal lexica de char_wb.
+2. **Calibracion de umbrales por costo:** Definir funcion de costo asimetrico por etiqueta segun el contexto de moderacion, reemplazando el F2-optimo generico.
+3. **Drift detection en produccion:** Configurar Vertex AI Model Monitoring con baseline del dataset de entrenamiento.
+4. **Pipeline KFP v2:** Migrar componentes de google_cloud_pipeline_components v1 a componentes nativos v2 para ejecucion en Vertex AI Pipelines.
