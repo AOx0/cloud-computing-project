@@ -2,9 +2,26 @@
 
 ## Diagrama
 
+El diagrama de arquitectura se genera desde ASCII art usando **aasvg** (Typst Universe / cargo install aasvg-cli). El archivo fuente es `docs/architecture_ascii.txt` y el SVG resultante se genera con:
+
+```bash
+cargo install aasvg-cli
+aasvg docs/architecture_ascii.txt -o docs/architecture_diagram.svg
 ```
-                     ┌──────────────────────────────────────────────┐
-                     │            GitHub Repository                 │
+
+El SVG usa CSS variables para soportar light y dark mode automaticamente via `prefers-color-scheme`.
+
+![Arquitectura completa del sistema MLOps en GCP](architecture_diagram.png)
+
+El diagrama incluye tres flujos principales (CI/CD, serving, reentrenamiento) y 13 componentes GCP.
+
+Tambien hay una version alternativa en Typst con Fletcher en `docs/architecture_diagram.typ`:
+
+```bash
+typst compile --format png --ppi 200 docs/architecture_diagram.typ docs/architecture_diagram.png
+```
+
+## Arquitectura (texto)
                      └──────────────────────┬─────────────────────┘
                                             │ push
                                             ▼
